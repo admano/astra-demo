@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(timeout 8 python3 portal.py)",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_decomposition.db \"SELECT event, detail, ts FROM decomp_log ORDER BY ts;\")",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_decomposition.db \"SELECT COUNT\\(*\\) as questions_count FROM questions;\")",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_ingestion.db \"SELECT pipeline_step, COUNT\\(*\\) FROM cases GROUP BY pipeline_step;\")",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_decomposition.db \"PRAGMA table_info\\(decomp_log\\);\")",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_decomposition.db 'DELETE FROM questions; DELETE FROM decomp_log;')",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_ingestion.db 'UPDATE cases SET pipeline_step='\\\\''ANALYSIS_DONE'\\\\'' WHERE pipeline_step='\\\\''DECOMPOSITION_DONE'\\\\'';')",
+      "Bash(sqlite3 /Users/adam.taoussi/Documents/astra_phase_00_files/demo_ingestion.db 'SELECT pipeline_step, COUNT\\(*\\) FROM cases GROUP BY pipeline_step;')",
+      "Bash(python3 portal.py)",
+      "Bash(curl -s http://localhost:8080/status)",
+      "Bash(sqlite3 demo_decomposition.db \"SELECT COUNT\\(*\\) as questions, \\(SELECT COUNT\\(*\\) FROM decomp_log\\) as log_entries FROM questions;\")",
+      "Bash(sqlite3 demo_decomposition.db \"SELECT event, detail FROM decomp_log ORDER BY ts LIMIT 10;\")",
+      "Bash(sqlite3 demo_ingestion.db \"SELECT pipeline_step, COUNT\\(*\\) FROM cases GROUP BY pipeline_step;\")"
+    ]
+  }
+}
