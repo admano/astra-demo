@@ -41,6 +41,7 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from string import Template
 from typing import Any
 
 # ─────────────────────────────────────────────────────────────
@@ -48,10 +49,15 @@ from typing import Any
 # ─────────────────────────────────────────────────────────────
 
 DEMO_DIR          = Path(__file__).parent
-RECEPTION_DB_PATH = DEMO_DIR / "demo_reception.db"
-INGESTION_DB_PATH = DEMO_DIR / "demo_ingestion.db"
-SECURITY_DB_PATH  = DEMO_DIR / "demo_security.db"
+RECEPTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_reception.db"
+INGESTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_ingestion.db"
+SECURITY_DB_PATH  = DEMO_DIR /"demo_db" / "demo_security.db"
 PORT              = 8002
+TEMPLATES_DIR     = DEMO_DIR / "templates"
+
+
+def _load_template(name: str) -> Template:
+    return Template((TEMPLATES_DIR / name).read_text(encoding="utf-8"))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -554,83 +560,6 @@ def _print_result(case: dict, result: dict) -> None:
 # WEB DASHBOARD  (port 8002)
 # ─────────────────────────────────────────────────────────────
 
-CSS = """
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
-     background:#f0f2f5;min-height:100vh;padding:32px 20px}
-.page{max-width:960px;margin:0 auto}
-.header{background:#1a2332;color:white;border-radius:8px;
-        padding:20px 28px;margin-bottom:24px;
-        display:flex;align-items:center;gap:16px}
-.phase-badge{background:#e85d04;color:white;font-size:10px;font-weight:700;
-             padding:3px 8px;border-radius:3px;letter-spacing:.06em;text-transform:uppercase}
-.header h1{font-size:18px;font-weight:600}
-.header p{font-size:12px;color:#8b949e;margin-top:2px}
-.header-right{margin-left:auto;text-align:right}
-.header-right span{font-size:11px;color:#8b949e}
-
-.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
-.stat{background:white;border-radius:7px;padding:14px 18px;
-      box-shadow:0 1px 3px rgba(0,0,0,.08)}
-.stat-num{font-size:26px;font-weight:700;color:#1a2332}
-.stat-label{font-size:10px;color:#9ca3af;margin-top:2px;
-            text-transform:uppercase;letter-spacing:.05em}
-
-.section-title{font-size:11px;font-weight:700;color:#9ca3af;
-               text-transform:uppercase;letter-spacing:.07em;
-               margin-bottom:10px;padding:0 2px}
-
-.card{background:white;border-radius:7px;
-      box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden;margin-bottom:20px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;padding:10px 14px;background:#f8f9fb;color:#6b7280;
-   font-size:11px;font-weight:600;text-transform:uppercase;
-   letter-spacing:.05em;border-bottom:1px solid #e5e7eb}
-td{padding:11px 14px;border-bottom:1px solid #f3f4f6;
-   color:#374151;vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:#fafafa}
-
-.pill{display:inline-block;font-size:10px;font-weight:700;
-      padding:2px 8px;border-radius:10px;text-transform:uppercase}
-.clean    {background:#d1fae5;color:#065f46}
-.escalate {background:#fee2e2;color:#991b1b}
-.blocked  {background:#fef3c7;color:#92400e}
-.pending  {background:#f3f4f6;color:#6b7280}
-
-.step-row{display:flex;align-items:flex-start;gap:12px;padding:12px 16px;
-          border-bottom:1px solid #f3f4f6}
-.step-row:last-child{border-bottom:none}
-.step-icon{font-size:18px;flex-shrink:0;margin-top:1px}
-.step-content{flex:1;min-width:0}
-.step-title{font-size:13px;font-weight:600;color:#1f2937}
-.step-desc{font-size:11px;color:#6b7280;margin-top:2px;line-height:1.5}
-.step-result{font-size:11px;font-weight:600;margin-top:4px}
-.result-clean   {color:#065f46}
-.result-blocked {color:#dc2626}
-
-.att-row{display:flex;align-items:center;gap:8px;
-         padding:6px 14px;border-bottom:1px solid #f9fafb;font-size:12px}
-.att-row:last-child{border-bottom:none}
-.att-name{flex:1;font-family:monospace;font-size:11px;color:#374151}
-.att-mime{color:#9ca3af;font-size:10px;font-family:monospace}
-
-.log-panel{background:#1a2332;border-radius:7px;
-           padding:16px 20px;max-height:260px;overflow-y:auto}
-.log-line{font-family:'Menlo','Courier New',monospace;font-size:11px;
-          color:#8b949e;padding:2px 0;line-height:1.6}
-.log-line .ts{color:#484f58}
-.ev-body-clean   {color:#2ea043}
-.ev-body-toxic   {color:#f85149}
-.ev-att-clean    {color:#388bfd}
-.ev-att-blocked  {color:#d29922}
-.ev-done         {color:#a371f7}
-.ev-escalate     {color:#f85149;font-weight:700}
-
-.refresh-note{font-size:11px;color:#9ca3af;text-align:center;margin-top:8px}
-.empty-note{text-align:center;color:#9ca3af;padding:24px;font-size:13px}
-"""
-
 
 def _verdict_pill(verdict: str) -> str:
     cls = "clean" if verdict == "CLEAN" else "escalate"
@@ -818,55 +747,13 @@ def render_dashboard(sec_conn: sqlite3.Connection) -> str:
     if not log_lines:
         log_lines = '<div class="log-line" style="color:#484f58">— no events yet —</div>'
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="5">
-<title>Phase 03 — Security</title>
-<style>{CSS}</style>
-</head>
-<body>
-<div class="page">
-  <div class="header">
-    <div>
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-        <span class="phase-badge">Phase 03</span>
-        <h1>Security</h1>
-      </div>
-      <p>Toxicity · MIME check · Antimalware · Docling → Markdown</p>
-    </div>
-    <div class="header-right">
-      <span>Polling Ingestion every 5s</span><br>
-      <span style="color:#2ea043;font-weight:600">● Live</span>
-    </div>
-  </div>
-
-  {stats_html}
-
-  <div class="section-title">Results per case</div>
-  <div class="card">
-    <table>
-      <thead>
-        <tr>
-          <th>Case ID</th><th>Source</th><th>Subject</th>
-          <th>Body</th><th>Attachments</th><th>Verdict</th>
-        </tr>
-      </thead>
-      <tbody>{table_rows}</tbody>
-    </table>
-  </div>
-
-  {checks_html}
-  {att_table}
-
-  <div class="section-title">Audit Log</div>
-  <div class="log-panel">{log_lines}</div>
-  <p class="refresh-note">Auto-refreshes every 5 seconds</p>
-</div>
-</body>
-</html>"""
+    return _load_template("security_dashboard.html").substitute(
+        stats=stats_html,
+        table_rows=table_rows,
+        checks_html=checks_html,
+        att_table=att_table,
+        log_lines=log_lines,
+    )
 
 
 # ─────────────────────────────────────────────────────────────

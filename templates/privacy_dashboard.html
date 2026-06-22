@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>Phase 04 — Privacy</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+     background:#f0f2f5;min-height:100vh;padding:32px 20px}
+.page{max-width:980px;margin:0 auto}
+.header{background:#1a2332;color:white;border-radius:8px;
+        padding:20px 28px;margin-bottom:24px;
+        display:flex;align-items:center;gap:16px}
+.phase-badge{background:#7c3aed;color:white;font-size:10px;font-weight:700;
+             padding:3px 8px;border-radius:3px;letter-spacing:.06em;
+             text-transform:uppercase}
+.header h1{font-size:18px;font-weight:600}
+.header p{font-size:12px;color:#8b949e;margin-top:2px}
+.hdr-right{margin-left:auto;text-align:right}
+.hdr-right span{font-size:11px;color:#8b949e}
+
+.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
+.stat{background:white;border-radius:7px;padding:14px 18px;
+      box-shadow:0 1px 3px rgba(0,0,0,.08)}
+.stat-num{font-size:26px;font-weight:700;color:#1a2332}
+.stat-label{font-size:10px;color:#9ca3af;margin-top:2px;
+            text-transform:uppercase;letter-spacing:.05em}
+
+.sec-title{font-size:11px;font-weight:700;color:#9ca3af;
+           text-transform:uppercase;letter-spacing:.07em;
+           margin-bottom:10px;padding:0 2px;margin-top:20px}
+
+.card{background:white;border-radius:7px;
+      box-shadow:0 1px 3px rgba(0,0,0,.08);overflow:hidden;margin-bottom:16px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;padding:10px 14px;background:#f8f9fb;color:#6b7280;
+   font-size:11px;font-weight:600;text-transform:uppercase;
+   letter-spacing:.05em;border-bottom:1px solid #e5e7eb}
+td{padding:10px 14px;border-bottom:1px solid #f3f4f6;
+   color:#374151;vertical-align:top}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#fafafa}
+.mono{font-family:'Menlo','Courier New',monospace;font-size:11px}
+
+.token-tag{display:inline-block;font-family:monospace;font-size:11px;
+           font-weight:700;padding:2px 7px;border-radius:3px;
+           background:#ede9fe;color:#5b21b6;margin:2px 2px 2px 0}
+.type-pill{display:inline-block;font-size:10px;font-weight:600;
+           padding:1px 6px;border-radius:3px;text-transform:uppercase}
+.tp-person  {background:#dbeafe;color:#1e40af}
+.tp-email   {background:#fce7f3;color:#9d174d}
+.tp-phone   {background:#d1fae5;color:#065f46}
+.tp-address {background:#fef3c7;color:#92400e}
+.tp-zip     {background:#fef3c7;color:#92400e}
+.tp-iban    {background:#fee2e2;color:#991b1b}
+.tp-ahv     {background:#fee2e2;color:#991b1b}
+.tp-date    {background:#f3f4f6;color:#374151}
+.risk-safe      {color:#065f46}
+.risk-escalated {color:#92400e}
+.risk-blocked   {color:#991b1b;font-weight:700}
+
+.diff-row{padding:14px 18px;border-bottom:1px solid #f3f4f6}
+.diff-row:last-child{border-bottom:none}
+.diff-label{font-size:10px;font-weight:700;color:#9ca3af;
+            text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px}
+.diff-text{font-size:12px;line-height:1.7;color:#374151;
+           font-family:'Menlo',monospace;white-space:pre-wrap;word-break:break-word}
+.highlight{background:#ede9fe;color:#5b21b6;padding:0 2px;border-radius:2px}
+
+.log-panel{background:#1a2332;border-radius:7px;
+           padding:16px 20px;max-height:240px;overflow-y:auto}
+.log-line{font-family:'Menlo',monospace;font-size:11px;
+          color:#8b949e;padding:2px 0;line-height:1.6}
+.ts{color:#484f58}
+.ev-subj{color:#a371f7}
+.ev-body{color:#a371f7}
+.ev-att {color:#388bfd}
+.ev-tok {color:#2ea043}
+.ev-kanon{color:#2ea043}
+.ev-done{color:#d29922}
+
+.refresh-note{font-size:11px;color:#9ca3af;text-align:center;margin-top:8px}
+.empty{text-align:center;color:#9ca3af;padding:24px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="header">
+    <div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
+        <span class="phase-badge">Phase 04</span>
+        <h1>Privacy</h1>
+      </div>
+      <p>PII anonymisation · Presidio + Swiss recognisers · PseudonymVault · k-anonymity · Risk gate</p>
+    </div>
+    <div class="hdr-right">
+      <span>Polling Security every 5s</span><br>
+      <span style="color:#2ea043;font-weight:600">● Live</span>
+    </div>
+  </div>
+
+  $stats
+
+  <div class="sec-title">Anonymisation results per case</div>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Case ID</th><th>Source</th><th>Subject</th>
+          <th>PII Found</th><th>k-Anon</th><th>Risk / Status</th><th>Vault Session</th>
+        </tr>
+      </thead>
+      <tbody>$tbl_rows</tbody>
+    </table>
+  </div>
+
+  $diff_html
+
+  <div class="sec-title">Audit Log</div>
+  <div class="log-panel">$log_lines</div>
+  <p class="refresh-note">Auto-refreshes every 5 seconds</p>
+</div>
+</body>
+</html>

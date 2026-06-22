@@ -36,16 +36,22 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from string import Template
 from typing import Any
 
 # ─────────────────────────────────────────────────────────────
 # PATHS  — Ingestion reads Reception's DB, writes its own
 # ─────────────────────────────────────────────────────────────
 
-DEMO_DIR          = Path(__file__).parent
-RECEPTION_DB_PATH = DEMO_DIR / "demo_reception.db"
-INGESTION_DB_PATH = DEMO_DIR / "demo_ingestion.db"
+DEMO_DIR          = Path(__file__).parent 
+RECEPTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_reception.db"
+INGESTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_ingestion.db"
 DEMO_TENANT_ID    = "11111111-1111-1111-1111-111111111111"
+TEMPLATES_DIR     = DEMO_DIR / "templates"
+
+
+def _load_template(name: str) -> Template:
+    return Template((TEMPLATES_DIR / name).read_text(encoding="utf-8"))
 PORT              = 8001
 
 
@@ -386,108 +392,6 @@ def _print_ingested(case: dict[str, Any]) -> None:
 # WEB DASHBOARD  (port 8001)
 # ─────────────────────────────────────────────────────────────
 
-CSS = """
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-  background: #f0f2f5; min-height: 100vh; padding: 32px 20px;
-}
-.page { max-width: 900px; margin: 0 auto; }
-.header {
-  background: #1a2332; color: white; border-radius: 8px;
-  padding: 20px 28px; margin-bottom: 24px;
-  display: flex; align-items: center; gap: 16px;
-}
-.header-badge {
-  background: #2ea043; color: white; font-size: 10px; font-weight: 700;
-  padding: 3px 8px; border-radius: 3px; letter-spacing: .06em; text-transform: uppercase;
-}
-.header h1 { font-size: 18px; font-weight: 600; }
-.header p  { font-size: 12px; color: #8b949e; margin-top: 2px; }
-.header-right { margin-left: auto; text-align: right; }
-.header-right span { font-size: 11px; color: #8b949e; }
-
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
-.stat-card {
-  background: white; border-radius: 7px; padding: 16px 20px;
-  box-shadow: 0 1px 3px rgba(0,0,0,.08);
-}
-.stat-num  { font-size: 28px; font-weight: 700; color: #1a2332; }
-.stat-label { font-size: 11px; color: #8b949e; margin-top: 2px; text-transform: uppercase; letter-spacing: .05em; }
-
-.section-title {
-  font-size: 11px; font-weight: 700; color: #8b949e;
-  text-transform: uppercase; letter-spacing: .07em;
-  margin-bottom: 10px; padding: 0 2px;
-}
-
-.case-table {
-  background: white; border-radius: 7px;
-  box-shadow: 0 1px 3px rgba(0,0,0,.08); overflow: hidden;
-  margin-bottom: 24px;
-}
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-th {
-  text-align: left; padding: 10px 14px;
-  background: #f8f9fb; color: #6b7280;
-  font-size: 11px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: .05em; border-bottom: 1px solid #e5e7eb;
-}
-td { padding: 11px 14px; border-bottom: 1px solid #f3f4f6; color: #374151; vertical-align: middle; }
-tr:last-child td { border-bottom: none; }
-tr:hover td { background: #fafafa; }
-
-.pill {
-  display: inline-block; font-size: 10px; font-weight: 700;
-  padding: 2px 8px; border-radius: 10px; text-transform: uppercase;
-}
-.pill-open     { background: #dbeafe; color: #1d4ed8; }
-.pill-followup { background: #fef3c7; color: #92400e; }
-.pill-flagged  { background: #fee2e2; color: #dc2626; }
-
-.src-dot {
-  display: inline-block; width: 8px; height: 8px;
-  border-radius: 50%; margin-right: 5px; vertical-align: middle;
-}
-.dot-email { background: #3b82f6; }
-.dot-staff { background: #f59e0b; }
-.dot-scan  { background: #8b5cf6; }
-.dot-form  { background: #10b981; }
-
-.log-panel {
-  background: #1a2332; border-radius: 7px;
-  padding: 16px 20px; max-height: 280px; overflow-y: auto;
-}
-.log-line {
-  font-family: 'Menlo', 'Courier New', monospace; font-size: 11px;
-  color: #8b949e; padding: 2px 0; line-height: 1.6;
-}
-.log-line .ts    { color: #484f58; }
-.log-line .event { font-weight: 600; }
-.log-line .ev-created { color: #2ea043; }
-.log-line .ev-ack     { color: #388bfd; }
-.log-line .ev-outlook { color: #d29922; }
-
-.refresh-note {
-  font-size: 11px; color: #9ca3af; text-align: center;
-  margin-top: 8px;
-}
-
-.ack-detail {
-  background: #f8f9fb; border-left: 3px solid #388bfd;
-  border-radius: 0 5px 5px 0; padding: 12px 16px; margin: 8px 0;
-  font-size: 12px; color: #374151;
-}
-.ack-detail .ack-label {
-  font-size: 10px; font-weight: 700; color: #6b7280;
-  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px;
-}
-pre.ack-body {
-  font-family: 'Menlo', monospace; font-size: 11px;
-  white-space: pre-wrap; color: #4b5563; margin-top: 6px;
-}
-"""
-
 def _src_dot(src: str) -> str:
     cls = {"DIRECT_EMAIL":"dot-email","STAFF_FORWARD":"dot-staff",
            "POSTAL_SCAN":"dot-scan","WEB_FORM":"dot-form"}.get(src,"dot-email")
@@ -597,60 +501,12 @@ def render_dashboard(ing_conn: sqlite3.Connection) -> str:
     if not log_lines:
         log_lines = '<div class="log-line" style="color:#484f58">— no events yet —</div>'
 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="5">
-<title>Phase 02 — Ingestion</title>
-<style>{CSS}</style>
-</head>
-<body>
-<div class="page">
-
-  <div class="header">
-    <div>
-      <div style="display:flex;align-items:center;gap:10px;margin-bottom:4px">
-        <span class="header-badge">Phase 02</span>
-        <h1>Ingestion</h1>
-      </div>
-      <p>Reads from Reception → deduplicates → creates cases → sends ACK</p>
-    </div>
-    <div class="header-right">
-      <span>Polling Reception every 5s</span><br>
-      <span style="color:#2ea043;font-weight:600">● Live</span>
-    </div>
-  </div>
-
-  {stats_html}
-
-  <div class="section-title">Cases created by Ingestion</div>
-  <div class="case-table">
-    <table>
-      <thead>
-        <tr>
-          <th>Case ID</th>
-          <th>Source</th>
-          <th>Subject</th>
-          <th>Language</th>
-          <th>Status</th>
-          <th>Time</th>
-        </tr>
-      </thead>
-      <tbody>{rows_html}</tbody>
-    </table>
-  </div>
-
-  {ack_html}
-
-  <div class="section-title" style="margin-top:24px">Audit Log</div>
-  <div class="log-panel">{log_lines}</div>
-
-  <p class="refresh-note">Auto-refreshes every 5 seconds</p>
-</div>
-</body>
-</html>"""
+    return _load_template("ingestion_dashboard.html").substitute(
+        stats=stats_html,
+        rows=rows_html,
+        ack=ack_html,
+        log_lines=log_lines,
+    )
 
 
 class IngestionDashboardHandler(http.server.BaseHTTPRequestHandler):

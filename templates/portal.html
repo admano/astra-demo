@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ASTRA — Demo Portal</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:#0d1117;font-family:system-ui,sans-serif}
+
+  /* ── Header ── */
+  #hdr{
+    display:flex;align-items:center;gap:12px;
+    padding:0 20px;height:48px;flex-shrink:0;
+    background:#161b22;border-bottom:1px solid #21262d;
+  }
+  #hdr .logo{font-size:1.05rem;font-weight:700;letter-spacing:.08em;
+              background:linear-gradient(135deg,#7c9ef0,#a78bfa);
+              -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  #hdr .tagline{font-size:0.75rem;color:#484f58}
+  #hdr .spacer{flex:1}
+  #hdr .phase-label{font-size:0.78rem;color:#8b949e;
+    padding:3px 10px;background:#21262d;border-radius:4px}
+
+  /* ── Layout ── */
+  #shell{display:flex;height:calc(100vh - 48px)}
+
+  /* ── Sidebar ── */
+  #sb{
+    width:210px;flex-shrink:0;
+    background:#0d1117;border-right:1px solid #21262d;
+    display:flex;flex-direction:column;overflow-y:auto;
+  }
+  .grp-hdr{
+    padding:12px 14px 4px;font-size:0.65rem;
+    font-weight:700;letter-spacing:.1em;
+    color:#484f58;text-transform:uppercase;
+  }
+  .phase-btn{
+    display:flex;align-items:center;gap:9px;
+    padding:9px 14px;cursor:pointer;border:none;
+    background:transparent;width:100%;text-align:left;
+    color:#8b949e;transition:background .12s;
+    border-left:3px solid transparent;
+  }
+  .phase-btn:hover{background:#161b22;color:#c9d1d9}
+  .phase-btn.active{
+    background:#1c2333;border-left-color:#7c9ef0;color:#e6edf3;
+  }
+  .phase-btn .num{
+    font-size:0.65rem;color:#484f58;width:22px;flex-shrink:0;font-weight:600;
+  }
+  .phase-btn.active .num{color:#7c9ef0}
+  .phase-btn .pname{font-size:0.82rem;flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dot{
+    width:7px;height:7px;border-radius:50%;flex-shrink:0;
+    background:#484f58;transition:background .3s;
+  }
+  .dot.up{background:#22c55e}
+  .dot.down{background:#ef4444}
+  .dot.starting{background:#f59e0b}
+  .dot.missing{background:#6b7280}
+
+  /* ── Disabled phases (demo) ── */
+  .phase-btn.disabled{
+    opacity:0.35;cursor:not-allowed;pointer-events:none;
+  }
+
+  /* ── Home button ── */
+  #home-btn{
+    display:flex;align-items:center;gap:9px;
+    padding:11px 14px;cursor:pointer;border:none;
+    background:#161b22;width:100%;text-align:left;
+    color:#7c9ef0;border-bottom:1px solid #21262d;
+    border-left:3px solid #7c9ef0;font-size:0.82rem;font-weight:600;
+    transition:background .12s;flex-shrink:0;
+  }
+  #home-btn:hover{background:#1c2333}
+  #home-btn svg{flex-shrink:0}
+
+  /* ── Content ── */
+  #content{flex:1;display:flex;flex-direction:column}
+  #landing{flex:1;background:#0d1117;display:block}
+  #phase-frame{flex:1;border:none;width:100%;height:100%;display:none;background:#fff}
+</style>
+</head>
+<body>
+
+<div id="hdr">
+  <span class="logo">ASTRA</span>
+  <span class="tagline">Demo Pipeline Portal</span>
+  <span class="spacer"></span>
+  <span class="phase-label" id="current-label">Overview</span>
+</div>
+
+<div id="shell">
+
+  <!-- Sidebar -->
+  <div id="sb">
+    <button id="home-btn" onclick="showOverview()">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 9.5L12 3l9 6.5V20a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/>
+        <polyline points="9 21 9 13 15 13 15 21"/>
+      </svg>
+      Dashboard
+    </button>
+    $sidebar_html
+  </div>
+
+  <!-- Content -->
+  <div id="content">
+    <iframe id="landing" srcdoc="$landing_srcdoc" scrolling="yes"></iframe>
+    <iframe id="phase-frame" src="about:blank" allowfullscreen></iframe>
+  </div>
+
+</div>
+
+<script>
+var currentPort = null;
+
+function loadPhase(port, num, name) {
+  currentPort = port;
+  var frame = document.getElementById('phase-frame');
+  var landing = document.getElementById('landing');
+  frame.src = 'http://localhost:' + port + '/';
+  frame.style.display = 'block';
+  landing.style.display = 'none';
+  document.getElementById('current-label').textContent = 'Phase ' + String(num).padStart(2,'0') + ' — ' + name;
+  document.querySelectorAll('.phase-btn').forEach(function(b) { b.classList.remove('active'); });
+  document.getElementById('home-btn').style.borderLeftColor = 'transparent';
+  document.getElementById('home-btn').style.background = '#161b22';
+  var btn = document.querySelector('[data-port="' + port + '"]');
+  if (btn) btn.classList.add('active');
+}
+
+function showOverview() {
+  currentPort = null;
+  var frame = document.getElementById('phase-frame');
+  var landing = document.getElementById('landing');
+  frame.style.display = 'none';
+  landing.style.display = 'block';
+  document.getElementById('current-label').textContent = 'Overview';
+  document.querySelectorAll('.phase-btn').forEach(function(b) { b.classList.remove('active'); });
+  var hb = document.getElementById('home-btn');
+  hb.style.borderLeftColor = '#7c9ef0';
+  hb.style.background = '#1c2333';
+}
+
+// Live status polling
+function updateStatus() {
+  fetch('/status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      Object.keys(data).forEach(function(num) {
+        var dot = document.querySelector('[data-dot="' + num + '"]');
+        if (dot) {
+          dot.className = 'dot ' + data[num];
+        }
+        // also update step dot in landing if visible
+        var sd = document.getElementById('step-dot-' + num);
+        if (sd) {
+          var c = data[num] === 'up' ? '#22c55e' :
+                  data[num] === 'down' ? '#ef4444' :
+                  data[num] === 'starting' ? '#f59e0b' : '#6b7280';
+          sd.style.background = c;
+        }
+      });
+    })
+    .catch(function() {});
+}
+setInterval(updateStatus, 3000);
+updateStatus();
+</script>
+</body>
+</html>

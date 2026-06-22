@@ -1,0 +1,36 @@
+<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+            height:100%;gap:32px;padding:40px;color:#c9d1d9;font-family:system-ui,sans-serif;">
+  <div style="text-align:center;">
+    <div style="font-size:3rem;font-weight:700;letter-spacing:0.1em;
+                background:linear-gradient(135deg,#7c9ef0,#a78bfa);
+                -webkit-background-clip:text;-webkit-text-fill-color:transparent;">
+      ASTRA
+    </div>
+    <div style="font-size:1rem;color:#8b949e;margin-top:4px;">
+      Automated Structured Treatment &amp; Response Architecture
+    </div>
+    <div style="font-size:0.82rem;color:#484f58;margin-top:2px;">Demo Pipeline — Unified Portal</div>
+  </div>
+
+  <!-- pipeline flow -->
+  <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;max-width:780px;">
+    {pipeline_steps}
+  </div>
+
+  <div style="font-size:0.82rem;color:#484f58;text-align:center;max-width:480px;">
+    Select a phase in the sidebar to open its dashboard.<br>
+    All phases start automatically — wait for the status dots to turn green.
+  </div>
+</div>
+
+<!-- pipeline_step_tmpl
+<div style="display:flex;flex-direction:column;align-items:center;gap:4px;
+            padding:12px 16px;background:#161b22;border:1px solid #30363d;
+            border-radius:8px;min-width:120px;cursor:pointer;"
+     onclick="top.loadPhase({port})">
+  <div style="font-size:0.68rem;color:#484f58;font-weight:600;">PHASE {num:02d}</div>
+  <div style="font-size:0.82rem;font-weight:500;color:#c9d1d9;">{name}</div>
+  <div id="step-dot-{num}" style="width:8px;height:8px;border-radius:50%;
+       background:{dot_color};margin-top:2px;"></div>
+</div>
+-->

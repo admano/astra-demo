@@ -13,7 +13,8 @@
       "Bash(curl -s http://localhost:8080/status)",
       "Bash(sqlite3 demo_decomposition.db \"SELECT COUNT\\(*\\) as questions, \\(SELECT COUNT\\(*\\) FROM decomp_log\\) as log_entries FROM questions;\")",
       "Bash(sqlite3 demo_decomposition.db \"SELECT event, detail FROM decomp_log ORDER BY ts LIMIT 10;\")",
-      "Bash(sqlite3 demo_ingestion.db \"SELECT pipeline_step, COUNT\\(*\\) FROM cases GROUP BY pipeline_step;\")"
+      "Bash(sqlite3 demo_ingestion.db \"SELECT pipeline_step, COUNT\\(*\\) FROM cases GROUP BY pipeline_step;\")",
+      "Bash(python3 -)"
     ]
   }
 }
