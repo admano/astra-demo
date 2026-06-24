@@ -9,32 +9,27 @@ when optional deps are missing. Falls back to a no-op detector gracefully.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
+import threading
 from dataclasses import dataclass
 from typing import List, Optional
 
-# ── Optional deps — wrapped so import never crashes ──────────────────────
+# ── Optional deps ──────────────────────────────────────────────────────────
+# Only check *presence* here (cheap, no code runs) — spaCy/presidio/transformers
+# are actually imported lazily, inside the background thread started below,
+# so a slow import (torch alone can take several seconds) never blocks the
+# phase's HTTP server from starting and serving the dashboard.
 
-try:
-    import spacy as _spacy  # noqa – spaCy needed by Presidio for tokenization
-    _SPACY_OK = True
-except ImportError:
-    _SPACY_OK = False
+_SPACY_OK       = importlib.util.find_spec("spacy") is not None
+_PRESIDIO_OK    = importlib.util.find_spec("presidio_analyzer") is not None
+_TRANSFORMERS_OK = importlib.util.find_spec("transformers") is not None
 
-try:
-    from presidio_analyzer import AnalyzerEngine, PatternRecognizer, Pattern
-    from presidio_analyzer.nlp_engine import NlpEngineProvider
-    _PRESIDIO_OK = True
-except ImportError:
-    _PRESIDIO_OK = False
-
-try:
-    from transformers import pipeline as _hf_pipeline
-except ImportError:
-    _hf_pipeline = None
-
-from privacy.swiss_recognizers import ALL_SWISS_RECOGNIZERS
+# NOTE: deliberately *not* imported at module level — swiss_recognizers.py
+# itself imports presidio_analyzer eagerly, which would defeat the deferred
+# loading above. Imported lazily inside build_analyzer() instead.
+# from privacy.swiss_recognizers import ALL_SWISS_RECOGNIZERS
 
 SPACY_MODEL = os.environ.get("SPACY_MODEL", "en_core_web_sm")
 
@@ -54,9 +49,20 @@ class RawEntity:
 
 # ── NLP engine builders ───────────────────────────────────────────────────
 
+def _is_cached(model_name: str) -> bool:
+    """True if a HF model is already on disk — checked with zero network calls."""
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(model_name, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
 def build_nlp_engine_or_none():
-    """Try to build a HuggingFace TransformersNlpEngine; return None on any failure."""
-    if not _PRESIDIO_OK:
+    """Try to build a HuggingFace TransformersNlpEngine; return None on any failure
+    or if the model isn't cached yet (avoids blocking phase startup on a download)."""
+    if not _PRESIDIO_OK or not _is_cached("dslim/bert-base-NER"):
         return None
     try:
         from presidio_analyzer.nlp_engine import TransformersNlpEngine
@@ -79,6 +85,7 @@ def build_analyzer():
         return None
     try:
         from presidio_analyzer import AnalyzerEngine, RecognizerRegistry
+        from privacy.swiss_recognizers import ALL_SWISS_RECOGNIZERS
         nlp_engine = build_nlp_engine_or_none()
         registry = RecognizerRegistry()
         if nlp_engine:
@@ -97,10 +104,12 @@ def build_analyzer():
 
 
 def load_huggingface_ner():
-    """Optional HuggingFace NER. Returns None if unavailable."""
-    if _hf_pipeline is None:
+    """Optional HuggingFace NER. Returns None if unavailable or not cached yet
+    (avoids blocking phase startup on a slow download)."""
+    if not _TRANSFORMERS_OK or not _is_cached("Davlan/bert-base-multilingual-cased-ner-hrl"):
         return None
     try:
+        from transformers import pipeline as _hf_pipeline
         return _hf_pipeline(
             task="token-classification",
             model="Davlan/bert-base-multilingual-cased-ner-hrl",
@@ -158,18 +167,39 @@ def merge_entities(entities: List[RawEntity]) -> List[RawEntity]:
     return sorted(cleaned, key=lambda e: e.start)
 
 
-# ── Module-level singletons — built once, wrapped so they never crash ─────
+# ── Module-level singletons ────────────────────────────────────────────────
+# Built in a background thread so importing this module — and therefore
+# starting the Privacy phase's HTTP server — never blocks on loading (or, if
+# not cached, downloading) a transformer model. detect_pii() already treats
+# both as optional, so requests served before loading finishes just get
+# Swiss/Presidio-only results and quietly get richer once it's ready.
 
-try:
-    _ANALYZER = build_analyzer()
-except Exception as _e:
-    print(f"  [Privacy/detector] WARNING: analyzer init failed: {_e}", file=sys.stderr)
-    _ANALYZER = None
+_ANALYZER = None
+_HF_NER = None
 
-try:
-    _HF_NER = load_huggingface_ner()
-except Exception:
-    _HF_NER = None
+
+def _load_analyzer() -> None:
+    global _ANALYZER
+    try:
+        _ANALYZER = build_analyzer()
+    except Exception as _e:
+        print(f"  [Privacy/detector] WARNING: analyzer init failed: {_e}", file=sys.stderr)
+
+
+def _load_hf_ner() -> None:
+    global _HF_NER
+    try:
+        _HF_NER = load_huggingface_ner()
+    except Exception:
+        pass
+
+
+# Two separate threads, not one running both sequentially: loading Presidio
+# (spaCy-backed) and the standalone transformers pipeline back-to-back in a
+# single thread has been observed to deadlock on macOS (torch's MPS backend
+# appears to need its first initialization on a thread of its own).
+threading.Thread(target=_load_analyzer, daemon=True).start()
+threading.Thread(target=_load_hf_ner, daemon=True).start()
 
 
 # ── Public API ────────────────────────────────────────────────────────────
