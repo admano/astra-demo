@@ -559,7 +559,16 @@ def render_dashboard(priv_conn: sqlite3.Connection) -> str:
         risk   = r.get("risk_score", 0.0)
         status = r.get("pipeline_status", "safe")
         risk_color = {"safe": "#065f46", "escalated": "#92400e", "blocked": "#dc2626"}.get(status, "#374151")
-        tbl_rows += f"""<tr>
+        case_data = json.dumps({
+            "case_id":    r["case_id"],
+            "subject":    meta.get("subject", ""),
+            "src":        src,
+            "body_anon":  r.get("body_anon", ""),
+            "risk":       risk,
+            "status":     status,
+            "session":    r.get("vault_session_id", ""),
+        })
+        tbl_rows += f"""<tr class="case-row" data-case='{case_data.replace("'", "&#39;")}' style="cursor:pointer">
           <td><span class="mono">{r['case_id'][:8]}…</span></td>
           <td>{src}</td>
           <td title="{_html.escape(meta.get('subject',''))}">{subj}</td>
@@ -569,76 +578,7 @@ def render_dashboard(priv_conn: sqlite3.Connection) -> str:
           <td><span class="mono" style="font-size:10px">{r.get('vault_session_id','')[:12]}</span></td>
         </tr>"""
 
-    # Before / After diff for the most recent case
     diff_html = ""
-    if results:
-        latest = results[0]
-        cid    = latest["case_id"]
-        meta   = case_meta.get(cid, {})
-
-        orig_body = ""
-        rec_db  = open_db_ro(RECEPTION_DB_PATH)
-        ing_db2 = open_db_ro(INGESTION_DB_PATH)
-        if rec_db and ing_db2:
-            try:
-                mid_row = ing_db2.execute(
-                    "SELECT message_id FROM cases WHERE case_id=?", (cid,)
-                ).fetchone()
-                if mid_row:
-                    row = rec_db.execute(
-                        "SELECT body FROM raw_messages WHERE message_id=?",
-                        (mid_row["message_id"],),
-                    ).fetchone()
-                    if row:
-                        orig_body = row["body"] or ""
-            finally:
-                rec_db.close()
-                ing_db2.close()
-
-        body_anon = latest.get("body_anon") or ""
-        risk_note = ""
-        if latest.get("pipeline_status") == "escalated":
-            risk_note = f'<div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:5px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#92400e">⚠️ Escalated — risk score {latest.get("risk_score",0):.3f} exceeds safe threshold. Flagged for manual review.</div>'
-        elif latest.get("pipeline_status") == "blocked":
-            risk_note = f'<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:5px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#991b1b">🚨 BLOCKED — risk score {latest.get("risk_score",0):.3f} too high. Output suppressed.</div>'
-
-        diff_html = f"""
-        <div class="sec-title">Before / After — case {cid[:8]}…</div>
-        {risk_note}
-        <div class="card">
-          <div class="diff-row">
-            <div class="diff-label">🔴 Original (contains PII — LLM never sees this)</div>
-            <div class="diff-text">{_html.escape((orig_body)[:400])}</div>
-          </div>
-          <div class="diff-row">
-            <div class="diff-label">✅ Anonymised (what Analysis + Response receive)</div>
-            <div class="diff-text">{_highlight_tags(body_anon[:400])}</div>
-          </div>
-        </div>"""
-
-        # Pseudonym token map for latest case
-        case_toks = [t for t in all_tokens if t["case_id"] == cid]
-        if case_toks:
-            tok_rows = ""
-            for t in case_toks:
-                css = _TYPE_CSS.get(t["pii_type"], "")
-                tok_rows += f"""<tr>
-                  <td><span class="token-tag">{_html.escape(t['tag'])}</span></td>
-                  <td><span class="type-pill {css}">{t['pii_type']}</span></td>
-                  <td class="mono">{_html.escape(t['value'][:60])}</td>
-                </tr>"""
-            diff_html += f"""
-            <div class="sec-title">Pseudonym Map — case {cid[:8]}…
-              <span style="font-weight:400;color:#6b7280">
-                (stored in vault · purged at session end · reconstructed at Dispatch)
-              </span>
-            </div>
-            <div class="card">
-              <table>
-                <thead><tr><th>Pseudonym</th><th>Type</th><th>Original Value</th></tr></thead>
-                <tbody>{tok_rows}</tbody>
-              </table>
-            </div>"""
 
     # Audit log
     ev_css = {
@@ -684,11 +624,66 @@ class PrivacyDashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/favicon.ico":
             self.send_response(204); self.end_headers(); return
+        if self.path.startswith("/case/"):
+            self._serve_case(self.path[6:])
+            return
         page = render_dashboard(self.priv_conn)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         self.wfile.write(page.encode())
+
+    def _serve_case(self, case_id: str) -> None:
+        """Return JSON with original body, anonymised body, and token map for one case."""
+        import json as _json
+        # Original body from reception DB
+        orig_body = ""
+        rec_db  = open_db_ro(RECEPTION_DB_PATH)
+        ing_db2 = open_db_ro(INGESTION_DB_PATH)
+        if rec_db and ing_db2:
+            try:
+                mid_row = ing_db2.execute(
+                    "SELECT message_id FROM cases WHERE case_id=?", (case_id,)
+                ).fetchone()
+                if mid_row:
+                    row = rec_db.execute(
+                        "SELECT body FROM raw_messages WHERE message_id=?",
+                        (mid_row["message_id"],),
+                    ).fetchone()
+                    if row:
+                        orig_body = row["body"] or ""
+            finally:
+                rec_db.close()
+                ing_db2.close()
+
+        # Anonymised result
+        result_row = self.priv_conn.execute(
+            "SELECT * FROM privacy_results WHERE case_id=?", (case_id,)
+        ).fetchone()
+        result = dict(result_row) if result_row else {}
+
+        # Token map
+        tokens = self.priv_conn.execute(
+            "SELECT tag, pii_type, value FROM pii_tokens WHERE case_id=? ORDER BY pii_type, tag",
+            (case_id,),
+        ).fetchall()
+        token_list = [{"tag": t["tag"], "pii_type": t["pii_type"], "value": t["value"]}
+                      for t in tokens]
+
+        payload = _json.dumps({
+            "case_id":      case_id,
+            "orig_body":    orig_body,
+            "body_anon":    result.get("body_anon", ""),
+            "subject_anon": result.get("subject_anon", ""),
+            "risk_score":   result.get("risk_score", 0.0),
+            "status":       result.get("pipeline_status", "safe"),
+            "tokens":       token_list,
+        }).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
 
 def make_handler(conn: sqlite3.Connection):

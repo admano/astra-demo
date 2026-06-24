@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -83,6 +84,17 @@ tr:hover td{background:#fafafa}
 
 .refresh-note{font-size:11px;color:#9ca3af;text-align:center;margin-top:8px}
 .empty{text-align:center;color:#9ca3af;padding:24px;font-size:13px}
+
+/* ── Clickable rows ── */
+tr.case-row:hover td{background:#f5f3ff;cursor:pointer}
+tr.case-row.selected td{background:#ede9fe}
+
+/* ── Detail panel ── */
+#detail-panel{display:none;margin-top:4px}
+#detail-panel .sec-title{margin-top:0}
+.detail-hint{font-size:12px;color:#9ca3af;text-align:center;
+             padding:20px;border:1px dashed #e5e7eb;border-radius:7px;
+             margin-top:4px;background:white}
 </style>
 </head>
 <body>
@@ -116,11 +128,125 @@ tr:hover td{background:#fafafa}
     </table>
   </div>
 
-  $diff_html
+  <!-- hint shown before any row is selected -->
+  <div id="detail-hint" class="detail-hint">
+    👆 Click any row above to see the Before / After diff and pseudonym map
+  </div>
+
+  <!-- detail panel — populated by JS on row click -->
+  <div id="detail-panel">
+    <div class="sec-title" id="detail-title">Before / After</div>
+    <div id="risk-note"></div>
+    <div class="card">
+      <div class="diff-row">
+        <div class="diff-label">🔴 Original (contains PII — LLM never sees this)</div>
+        <div class="diff-text" id="orig-body"></div>
+      </div>
+      <div class="diff-row">
+        <div class="diff-label">✅ Anonymised (what Analysis + Response receive)</div>
+        <div class="diff-text" id="anon-body"></div>
+      </div>
+    </div>
+
+    <div class="sec-title" id="map-title" style="margin-top:16px">
+      Pseudonym Map
+      <span style="font-weight:400;color:#6b7280">
+        (stored in vault · purged at session end · reconstructed at Dispatch)
+      </span>
+    </div>
+    <div class="card">
+      <table>
+        <thead><tr><th>Pseudonym</th><th>Type</th><th>Original Value</th></tr></thead>
+        <tbody id="token-rows"></tbody>
+      </table>
+    </div>
+  </div>
 
   <div class="sec-title">Audit Log</div>
   <div class="log-panel">$log_lines</div>
-  <p class="refresh-note">Auto-refreshes every 5 seconds</p>
+  <p class="refresh-note">Auto-refreshes every 5 seconds · click a row to inspect</p>
 </div>
-</body>
-</html>
+
+<script>
+const TYPE_CSS = {
+  FULL_NAME:'tp-person', EMAIL:'tp-email', PHONE:'tp-phone',
+  CH_PHONE:'tp-phone', CH_AHV:'tp-ahv', CH_IBAN:'tp-iban',
+  IBAN:'tp-iban', CH_UID:'tp-zip', IP_ADDRESS:'tp-date',
+  DATE_TIME:'tp-date', LOCATION:'tp-address', CREDIT_CARD:'tp-iban',
+  URL:'tp-date', PERSON:'tp-person', ADDRESS:'tp-address',
+  ZIP:'tp-zip', AHV:'tp-ahv', DATE:'tp-date',
+};
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+function highlightTags(text){
+  return esc(text).replace(
+    /([A-Za-z][A-Za-z0-9\-_]+_[A-Z][1-9]|user_[a-z][1-9]@redacted\.astra|https:\/\/url-[A-Z][1-9]\.redacted)/g,
+    '<span class="highlight">$$1</span>'
+  );
+}
+
+function selectRow(tr, caseId){
+  document.querySelectorAll('tr.case-row').forEach(r => r.classList.remove('selected'));
+  tr.classList.add('selected');
+
+  fetch('/case/' + caseId)
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('detail-hint').style.display = 'none';
+      const panel = document.getElementById('detail-panel');
+      panel.style.display = 'block';
+
+      document.getElementById('detail-title').textContent =
+        'Before / After — case ' + caseId.substring(0,8) + '…';
+      document.getElementById('map-title').childNodes[0].textContent =
+        'Pseudonym Map — case ' + caseId.substring(0,8) + '…  ';
+
+      // Risk note
+      const rn = document.getElementById('risk-note');
+      if(d.status === 'escalated'){
+        rn.innerHTML = '<div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:5px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#92400e">⚠️ Escalated — risk score '+d.risk_score.toFixed(3)+' exceeds safe threshold. Flagged for manual review.</div>';
+      } else if(d.status === 'blocked'){
+        rn.innerHTML = '<div style="background:#fee2e2;border:1px solid #fca5a5;border-radius:5px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#991b1b">🚨 BLOCKED — risk score '+d.risk_score.toFixed(3)+' too high. Output suppressed.</div>';
+      } else {
+        rn.innerHTML = '';
+      }
+
+      document.getElementById('orig-body').textContent = (d.orig_body || '').substring(0, 600);
+      document.getElementById('anon-body').innerHTML   = highlightTags((d.body_anon || '').substring(0, 600));
+
+      // Token map
+      const tbody = document.getElementById('token-rows');
+      if(!d.tokens || d.tokens.length === 0){
+        tbody.innerHTML = '<tr><td colspan="3" class="empty">No tokens found</td></tr>';
+      } else {
+        tbody.innerHTML = d.tokens.map(t =>
+          '<tr>' +
+          '<td><span class="token-tag">'+esc(t.tag)+'</span></td>' +
+          '<td><span class="type-pill '+(TYPE_CSS[t.pii_type]||'')+'">'+esc(t.pii_type)+'</span></td>' +
+          '<td class="mono">'+esc(t.value.substring(0,60))+'</td>' +
+          '</tr>'
+        ).join('');
+      }
+
+      panel.scrollIntoView({behavior:'smooth', block:'start'});
+    })
+    .catch(err => console.error('Case fetch failed:', err));
+}
+
+// Wire up all rows
+document.querySelectorAll('tr.case-row').forEach(tr => {
+  const data = JSON.parse(tr.dataset.case);
+  tr.addEventListener('click', () => {
+    sessionStorage.setItem('selected_case', data.case_id);
+    selectRow(tr, data.case_id);
+  });
+});
+
+// Auto-select: restore last selection, or fall back to first row
+const saved = sessionStorage.getItem('selected_case');
+const target = saved
+  ? document.querySelector('tr.case-row[data-case*="' + saved + '"]')
+  : null;
+(target || document.querySelector('tr.case-row'))?.click();
+</script>
