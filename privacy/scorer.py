@@ -26,7 +26,7 @@ a leaked SSN is far worse than a leaked location name.
 
 import re
 from typing import List
-from detector import RawEntity
+from privacy.detector import RawEntity
 
 # Sensitivity of each entity type — used ONLY to weight actual leaks.
 ENTITY_RISK_WEIGHTS = {

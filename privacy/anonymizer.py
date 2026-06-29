@@ -1,10 +1,11 @@
 
-from venv import logger
+import logging
 
-from models import PrivacyRunRequest
-from detector import RawEntity
+from privacy.detector import RawEntity
 from dataclasses import dataclass
-from vault import PseudonymVault
+from privacy.vault import PseudonymVault
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass

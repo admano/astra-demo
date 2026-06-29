@@ -33,6 +33,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,14 +41,20 @@ from string import Template
 from typing import Any
 
 # ─────────────────────────────────────────────────────────────
-# PATHS  — Ingestion reads Reception's DB, writes its own
+# SHARED PIPELINE DATABASE
+# Same SQLite file as every other phase — Ingestion reads
+# Reception's raw_messages table and writes its own cases table
+# in it, no separate per-phase DB file.
 # ─────────────────────────────────────────────────────────────
 
-DEMO_DIR          = Path(__file__).parent 
-RECEPTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_reception.db"
-INGESTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_ingestion.db"
+DEMO_DIR          = Path(__file__).parent
+DB_PATH           = DEMO_DIR / "demo_db" / "demo_pipeline.db"
 DEMO_TENANT_ID    = "11111111-1111-1111-1111-111111111111"
 TEMPLATES_DIR     = DEMO_DIR / "templates"
+
+# Next phase to wake up via HTTP once new cases are created.
+# Polling below remains as a fallback in case this call fails.
+SECURITY_NOTIFY_URL = "http://localhost:8002/notify"
 
 
 def _load_template(name: str) -> Template:
@@ -55,19 +62,52 @@ def _load_template(name: str) -> Template:
 PORT              = 8001
 
 
+def _notify_next_phase(url: str) -> None:
+    """Fire-and-forget HTTP push — see reception.py for the same helper."""
+    def _fire() -> None:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=2)
+        except Exception:
+            pass
+    threading.Thread(target=_fire, daemon=True).start()
+
+
 # ─────────────────────────────────────────────────────────────
 # DATABASE SETUP
 # ─────────────────────────────────────────────────────────────
 
+def _connect_shared_db(db_path: Path) -> sqlite3.Connection:
+    """
+    Connect to the pipeline DB shared by all four phases.
+
+    All four phases tend to start at once, and switching a brand-new file
+    to WAL mode briefly needs an exclusive lock — so the very first connect
+    can race with another phase doing the same thing. Retry a few times
+    instead of crashing on that one-time startup race.
+    """
+    db_path.parent.mkdir(exist_ok=True)
+    last_exc: sqlite3.OperationalError | None = None
+    for _ in range(10):
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            time.sleep(0.3)
+    raise last_exc
+
+
 def init_ingestion_db() -> sqlite3.Connection:
     """
-    Create the Ingestion database with two tables:
+    Create Ingestion's tables in the shared pipeline DB:
       cases         — one row per case (new or follow-up)
       ingested_ids  — tracks which raw message IDs were already processed
                       (deduplication guard)
     """
-    conn = sqlite3.connect(str(INGESTION_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_shared_db(DB_PATH)
 
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS cases (
@@ -109,14 +149,11 @@ def init_ingestion_db() -> sqlite3.Connection:
     return conn
 
 
-def open_reception_db() -> sqlite3.Connection | None:
-    """Open Reception DB read-only. Returns None if not found yet."""
-    if not RECEPTION_DB_PATH.exists():
-        return None
-    conn = sqlite3.connect(f"file:{RECEPTION_DB_PATH}?mode=ro", uri=True,
-                           check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _raw_messages_table_exists(conn: sqlite3.Connection) -> bool:
+    """True once Reception has created raw_messages in the shared DB."""
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='raw_messages'"
+    ).fetchone() is not None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -321,32 +358,24 @@ def ingest_message(raw: dict[str, Any],
 
 
 # ─────────────────────────────────────────────────────────────
-# POLLING LOOP
-# Reads pending raw messages from Reception DB every N seconds.
+# PROCESSING PASS
+# Reads pending raw messages from the shared DB and ingests them.
+# Triggered immediately via HTTP /notify, and on a 5s timer as a
+# fallback in case a notify call ever gets missed.
 # ─────────────────────────────────────────────────────────────
 
-def poll_and_ingest(ing_conn: sqlite3.Connection,
-                    stop_event: threading.Event) -> None:
-    """
-    Background thread: poll Reception DB for new messages and ingest them.
-    Runs until stop_event is set.
-    """
-    print("  [Ingestion] polling Reception DB every 5 seconds...")
+_PROCESS_LOCK = threading.Lock()
 
-    while not stop_event.is_set():
-        rec_conn = open_reception_db()
 
-        if rec_conn is None:
-            print("  [Ingestion] waiting for Reception DB...")
-            stop_event.wait(5)
-            continue
+def process_pending_ingestion(ing_conn: sqlite3.Connection) -> int:
+    """Ingest every pending raw message. Returns how many new cases were created."""
+    with _PROCESS_LOCK:
+        if not _raw_messages_table_exists(ing_conn):
+            return 0
 
-        try:
-            rows = rec_conn.execute(
-                "SELECT * FROM raw_messages ORDER BY received_at ASC"
-            ).fetchall()
-        finally:
-            rec_conn.close()
+        rows = ing_conn.execute(
+            "SELECT * FROM raw_messages ORDER BY received_at ASC"
+        ).fetchall()
 
         new_count = 0
         for row in rows:
@@ -358,7 +387,18 @@ def poll_and_ingest(ing_conn: sqlite3.Connection,
 
         if new_count:
             print(f"\n  [Ingestion] ✓ {new_count} new case(s) created.\n")
+            _notify_next_phase(SECURITY_NOTIFY_URL)
 
+        return new_count
+
+
+def poll_and_ingest(ing_conn: sqlite3.Connection,
+                    stop_event: threading.Event) -> None:
+    """Background thread: re-run the processing pass every 5s as a fallback."""
+    print("  [Ingestion] polling every 5 seconds (HTTP push is the fast path)...")
+
+    while not stop_event.is_set():
+        process_pending_ingestion(ing_conn)
         stop_event.wait(5)   # wait 5s or until stop_event
 
 
@@ -524,6 +564,13 @@ class IngestionDashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(html.encode())
 
+    def do_POST(self) -> None:
+        if self.path != "/notify":
+            self.send_response(404); self.end_headers(); return
+        process_pending_ingestion(self.ing_conn)
+        self.send_response(204)
+        self.end_headers()
+
 
 def make_dashboard_handler(conn: sqlite3.Connection):
     class H(IngestionDashboardHandler):
@@ -541,8 +588,8 @@ def main() -> None:
     print("═"*60)
 
     ing_conn = init_ingestion_db()
-    print(f"\n  ✓  Ingestion DB : {INGESTION_DB_PATH}")
-    print(f"  ✓  Reading from : {RECEPTION_DB_PATH}")
+    print(f"\n  ✓  Shared pipeline DB : {DB_PATH}")
+    print(f"  ✓  Notify endpoint    : POST /notify (pushed to by Reception)")
 
     # Start polling thread
     stop_event = threading.Event()

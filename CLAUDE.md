@@ -49,29 +49,50 @@ There are no automated tests in this repo currently.
 Every phase file (`reception.py`, `ingestion.py`, `security.py`, `privacy/privacy.py`)
 follows the same shape:
 
-- A module-level `init_<phase>_db()` creates/opens that phase's own SQLite file
-  under `demo_db/` (e.g. `demo_db/demo_ingestion.db`) and `CREATE TABLE IF NOT EXISTS`.
+- A module-level `init_<phase>_db()` (via the shared `_connect_shared_db()` helper
+  duplicated in each file) opens the **one shared** SQLite file at
+  `demo_db/demo_pipeline.db` and `CREATE TABLE IF NOT EXISTS` its own tables in it.
 - An `http.server.BaseHTTPRequestHandler` subclass serves a dashboard at the
   phase's port, rendering HTML via `string.Template` substitution from files in
-  `templates/` (no Jinja/Flask — just `Template(...).substitute(...)`).
-- A polling loop processes rows left by the *previous* phase and advances each
-  case's `pipeline_step` column once done.
+  `templates/` (no Jinja/Flask — just `Template(...).substitute(...)`), and a
+  `do_POST` handler for `/notify` (see below).
+- A `process_pending_<phase>()` function does the actual work (reads rows left
+  by the *previous* phase, advances each case's `pipeline_step` column once
+  done). It's reused by both the `/notify` handler and a 5s polling loop, and
+  guarded by a module-level `threading.Lock()` since both can call it
+  concurrently.
 
-### Cross-phase state machine
+### Cross-phase wiring: shared SQLite + HTTP push, polling as fallback
 
-Phases are chained through SQLite, not HTTP calls. Each phase reads rows from the
-upstream phase's DB filtered by a `pipeline_step` marker, and writes its own
-results plus an updated `pipeline_step` for the next phase to pick up:
+All four phases open the **same** `demo_db/demo_pipeline.db` file — there's no
+per-phase DB anymore. Each phase still owns its own tables (`raw_messages`,
+`cases`/`ingested_ids`, `security_results`/`attachment_results`,
+`privacy_results`/`pii_tokens`) and reads upstream tables directly via the same
+connection (no more opening a second read-only connection to another file).
+`pipeline_step` on the shared `cases` table is still the state marker:
 
 ```
-demo_reception.db          (raw_messages)
-   → demo_ingestion.db      cases.pipeline_step = INGESTION
-       → demo_security.db   pipeline_step = SECURITY_DONE
-           → demo_privacy.db pipeline_step = PRIVACY_DONE
+raw_messages  →  cases.pipeline_step = INGESTION
+              →  pipeline_step = SECURITY_DONE | SECURITY_ESCALATE
+              →  pipeline_step = PRIVACY_DONE | PRIVACY_BLOCKED
 ```
 
-`*.db` files are gitignored — they're regenerated on each run and hold whatever
-demo data you fed through Reception's web form.
+Because four processes hit one file, `_connect_shared_db()` sets
+`PRAGMA journal_mode=WAL` + `busy_timeout=5000` and retries the initial connect
+a few times — switching a brand-new file to WAL needs a brief exclusive lock,
+so when all four phases start at once the very first connect can race and hit
+`database is locked` otherwise.
+
+Instead of waiting on the old 5s poll tick, each phase fires a fire-and-forget
+HTTP `POST /notify` at the next phase right after writing new data
+(`_notify_next_phase()`, stdlib `urllib.request`, 2s timeout, failures
+swallowed). The 5s polling loop is kept as a fallback in case a notify call is
+missed (downstream phase briefly down, etc.) — so the pipeline is push-driven
+in the common case but self-heals like before if a push fails. Privacy has no
+downstream notify yet since Phase 05 (Analysis) doesn't exist.
+
+`demo_pipeline.db` is gitignored — it's regenerated on each run and holds
+whatever demo data you fed through Reception's web form.
 
 ### portal.py
 
@@ -105,15 +126,15 @@ anonymization logic lives in the `privacy` package alongside it:
 - `pipeline.py` — `run_privacy_pipeline()`, the orchestrator: identify input →
   normalize → apply rules → detect → pseudonymize → risk check → output.
 
-**Import gotcha:** modules inside `privacy/` are imported two different ways
-depending on caller. `privacy/privacy.py` manually inserts the repo root onto
-`sys.path` and does unqualified imports (`from pipeline import ...`) that resolve
-against `privacy/` itself (Python puts a script's own directory at `sys.path[0]`).
-But `pipeline.py` and `detector.py` import their siblings with the qualified
-`privacy.` prefix (`from privacy.models import ...`), which only resolves because
-the repo root was put on `sys.path`. `anonymizer.py` and `scorer.py`, on the other
-hand, use unqualified sibling imports (`from models import ...`,
-`from detector import ...`). Both styles currently work together, but only because
-of this specific dual-path setup — don't "clean up" the imports to be consistent
-without verifying both entry points (`privacy/privacy.py` as a script, and
-`privacy.pipeline` imported as a package from elsewhere) still resolve.
+**Import gotcha (fixed, keep it that way):** every module inside `privacy/`
+imports its siblings with the qualified `privacy.` prefix (`from privacy.vault
+import vault`), including `privacy/privacy.py` itself. This used to be mixed —
+`privacy.py`, `anonymizer.py` and `scorer.py` used unqualified imports (`from
+vault import vault`) — which silently loaded `vault`/`models`/`detector` as
+*second, separate module objects* distinct from `privacy.vault` etc. Two module
+objects meant two `PseudonymVault()` singletons: `pipeline.py` pseudonymized
+into one instance while `privacy.py` read `pii_tokens` back from the other,
+so `tokens_found`/`pii_tokens` were silently always empty even though
+anonymization itself worked. If you add a new submodule to `privacy/`, import
+its siblings with the qualified `privacy.` prefix — an unqualified import will
+quietly reintroduce this bug rather than raising an error.

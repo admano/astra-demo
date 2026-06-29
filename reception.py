@@ -31,7 +31,9 @@ import json
 import re
 import sqlite3
 import threading
+import time
 import urllib.parse
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,21 +42,51 @@ from typing import Any
 
 
 # ─────────────────────────────────────────────────────────────
-# SIMPLE IN-MEMORY STORE  (replaces the real DB for the demo)
+# SHARED PIPELINE DATABASE
+# All four phases open the same SQLite file and talk to each
+# other's tables directly — no per-phase DB files anymore.
 # ─────────────────────────────────────────────────────────────
-DATABASE_DIR = Path(__file__).parent 
-DB_PATH       = DATABASE_DIR /"demo_db" / "demo_reception.db"
+DATABASE_DIR  = Path(__file__).parent
+DB_PATH       = DATABASE_DIR / "demo_db" / "demo_pipeline.db"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
+
+# Next phase to wake up via HTTP as soon as a message is saved.
+# Polling (in ingestion.py) remains as a fallback in case this call
+# fails (e.g. Ingestion isn't up yet).
+INGESTION_NOTIFY_URL = "http://localhost:8001/notify"
 
 
 def _load_template(name: str) -> Template:
-    
+
     return Template((TEMPLATES_DIR / name).read_text(encoding="utf-8"))
 
 
+def _connect_shared_db(db_path: Path) -> sqlite3.Connection:
+    """
+    Connect to the pipeline DB shared by all four phases.
+
+    All four phases tend to start at once, and switching a brand-new file
+    to WAL mode briefly needs an exclusive lock — so the very first connect
+    can race with another phase doing the same thing. Retry a few times
+    instead of crashing on that one-time startup race.
+    """
+    db_path.parent.mkdir(exist_ok=True)
+    last_exc: sqlite3.OperationalError | None = None
+    for _ in range(10):
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            time.sleep(0.3)
+    raise last_exc
+
+
 def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_shared_db(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS raw_messages (
             id           TEXT PRIMARY KEY,
@@ -74,6 +106,18 @@ def init_db() -> sqlite3.Connection:
     """)
     conn.commit()
     return conn
+
+
+def _notify_next_phase(url: str) -> None:
+    """Fire-and-forget HTTP push so the next phase processes immediately
+    instead of waiting for its next poll tick. Failure is fine — the
+    receiving phase's own polling loop is the fallback."""
+    def _fire() -> None:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=2)
+        except Exception:
+            pass
+    threading.Thread(target=_fire, daemon=True).start()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -175,6 +219,7 @@ def save_message(conn: sqlite3.Connection, msg: dict[str, Any]) -> None:
         )
     """, msg)
     conn.commit()
+    _notify_next_phase(INGESTION_NOTIFY_URL)
 
 
 def get_all_messages(conn: sqlite3.Connection) -> list[dict]:
@@ -465,7 +510,7 @@ def main() -> None:
 
     # Init DB
     conn = init_db()
-    print(f"\n  ✓  SQLite demo DB:  {DB_PATH}")
+    print(f"\n  ✓  Shared pipeline DB:  {DB_PATH}")
 
     # Load the 3 simulated sources on startup
     print("\n  Loading simulated sources...")

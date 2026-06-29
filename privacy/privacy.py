@@ -45,6 +45,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -61,9 +62,14 @@ if str(_DEMO_DIR) not in sys.path:
     sys.path.insert(0, str(_DEMO_DIR))
 
 # ── Privacy engine (Presidio-based) ────────────────────────────────────────
-from pipeline import run_privacy_pipeline
-from models   import PrivacyRunRequest
-from vault    import vault as _vault
+# Imported via the qualified `privacy.*` path (not e.g. `from vault import
+# vault`) on purpose — an unqualified import here would make Python load
+# each submodule a second time under a different module name, creating a
+# second PseudonymVault singleton that never sees the sessions pipeline.py
+# actually wrote pseudonyms into.
+from privacy.pipeline import run_privacy_pipeline
+from privacy.models   import PrivacyRunRequest
+from privacy.vault    import vault as _vault
 
 logger = logging.getLogger(__name__)
 
@@ -71,21 +77,46 @@ logger = logging.getLogger(__name__)
 # PATHS
 # ─────────────────────────────────────────────────────────────
 
-DEMO_DIR          = _DEMO_DIR                  # <demo_root>/
-TEMPLATES_DIR     = DEMO_DIR / "templates"     # <demo_root>/templates/
-RECEPTION_DB_PATH = DEMO_DIR /"demo_db" /  "demo_reception.db"
-INGESTION_DB_PATH = DEMO_DIR /"demo_db" /  "demo_ingestion.db"
-SECURITY_DB_PATH  = DEMO_DIR /"demo_db" /  "demo_security.db"
-PRIVACY_DB_PATH   = DEMO_DIR /"demo_db" /  "demo_privacy.db"
-PORT              = 8003
+DEMO_DIR      = _DEMO_DIR                  # <demo_root>/
+TEMPLATES_DIR = DEMO_DIR / "templates"     # <demo_root>/templates/
+DB_PATH       = DEMO_DIR / "demo_db" / "demo_pipeline.db"   # shared by every phase
+PORT          = 8003
 
 # k-anonymity threshold (configurable per tenant in production)
 K_ANONYMITY_MIN = 3
+
+# No downstream phase exists yet (Phase 05 Analysis isn't built). Once it is,
+# add a _notify_next_phase() helper here (see reception.py/ingestion.py for
+# the pattern) and call it after a case clears PRIVACY_DONE.
 
 
 # ─────────────────────────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────────────────────────
+
+def _connect_shared_db(db_path: Path) -> sqlite3.Connection:
+    """
+    Connect to the pipeline DB shared by all four phases.
+
+    All four phases tend to start at once, and switching a brand-new file
+    to WAL mode briefly needs an exclusive lock — so the very first connect
+    can race with another phase doing the same thing. Retry a few times
+    instead of crashing on that one-time startup race.
+    """
+    db_path.parent.mkdir(exist_ok=True)
+    last_exc: sqlite3.OperationalError | None = None
+    for _ in range(10):
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            time.sleep(0.3)
+    raise last_exc
+
 
 def init_privacy_db() -> sqlite3.Connection:
     """
@@ -95,9 +126,7 @@ def init_privacy_db() -> sqlite3.Connection:
       attachment_anon  — anonymised attachment Markdowns
       privacy_log      — append-only audit events
     """
-    PRIVACY_DB_PATH.parent.mkdir(exist_ok=True)
-    conn = sqlite3.connect(str(PRIVACY_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_shared_db(DB_PATH)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS privacy_results (
             case_id          TEXT PRIMARY KEY,
@@ -140,13 +169,10 @@ def init_privacy_db() -> sqlite3.Connection:
     return conn
 
 
-def open_db_ro(path: Path) -> sqlite3.Connection | None:
-    if not path.exists():
-        return None
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
-                           check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
 def already_processed(priv_conn: sqlite3.Connection, case_id: str) -> bool:
@@ -306,16 +332,11 @@ def run_privacy(case: dict[str, Any],
     """, result)
     priv_conn.commit()
 
-    # ── Advance pipeline step ─────────────────────────────────────────────
+    # ── Advance pipeline step (shared cases table) ────────────────────────
     next_step = "PRIVACY_BLOCKED" if pipeline_status == "blocked" else "PRIVACY_DONE"
-    try:
-        ing = sqlite3.connect(str(INGESTION_DB_PATH), check_same_thread=False)
-        ing.execute("UPDATE cases SET pipeline_step=? WHERE case_id=?",
-                    (next_step, case_id))
-        ing.commit()
-        ing.close()
-    except Exception:
-        pass
+    priv_conn.execute("UPDATE cases SET pipeline_step=? WHERE case_id=?",
+                      (next_step, case_id))
+    priv_conn.commit()
 
     log_event(priv_conn, case_id, "PRIVACY_DONE",
               f"tokens={total_tokens} risk={risk_score:.3f} status={pipeline_status}")
@@ -325,33 +346,24 @@ def run_privacy(case: dict[str, Any],
 
 
 # ─────────────────────────────────────────────────────────────
-# POLLING LOOP
+# PROCESSING PASS
+# Reads pending cases from the shared DB and anonymises them.
+# Triggered immediately via HTTP /notify, and on a 5s timer as a
+# fallback in case a notify call ever gets missed.
 # ─────────────────────────────────────────────────────────────
 
-def poll_and_anonymise(priv_conn: sqlite3.Connection,
-                       stop_event: threading.Event) -> None:
-    print("  [Privacy] polling Security DB every 5 seconds...")
+_PROCESS_LOCK = threading.Lock()
 
-    while not stop_event.is_set():
-        ing_db = open_db_ro(INGESTION_DB_PATH)
-        rec_db = open_db_ro(RECEPTION_DB_PATH)
-        sec_db = open_db_ro(SECURITY_DB_PATH)
 
-        if not all([ing_db, rec_db, sec_db]):
-            print("  [Privacy] waiting for upstream DBs...")
-            stop_event.wait(5)
-            for db in [ing_db, rec_db, sec_db]:
-                if db:
-                    try: db.close()
-                    except Exception: pass
-            continue
+def process_pending_privacy(priv_conn: sqlite3.Connection) -> int:
+    """Anonymise every pending case. Returns how many were processed."""
+    with _PROCESS_LOCK:
+        if not _table_exists(priv_conn, "cases"):
+            return 0
 
-        try:
-            pending = ing_db.execute(
-                "SELECT * FROM cases WHERE pipeline_step='SECURITY_DONE'"
-            ).fetchall()
-        finally:
-            ing_db.close()
+        pending = priv_conn.execute(
+            "SELECT * FROM cases WHERE pipeline_step='SECURITY_DONE'"
+        ).fetchall()
 
         new_count = 0
         for row in pending:
@@ -359,23 +371,17 @@ def poll_and_anonymise(priv_conn: sqlite3.Connection,
             if already_processed(priv_conn, case["case_id"]):
                 continue
 
-            try:
-                raw_row = rec_db.execute(
-                    "SELECT * FROM raw_messages WHERE message_id=?",
-                    (case["message_id"],),
-                ).fetchone()
-                raw = dict(raw_row) if raw_row else {}
-            except Exception:
-                raw = {}
+            raw_row = priv_conn.execute(
+                "SELECT * FROM raw_messages WHERE message_id=?",
+                (case["message_id"],),
+            ).fetchone()
+            raw = dict(raw_row) if raw_row else {}
 
-            try:
-                att_rows = sec_db.execute(
-                    "SELECT * FROM attachment_results WHERE case_id=? AND status='CLEAN'",
-                    (case["case_id"],),
-                ).fetchall()
-                sec_atts = [dict(r) for r in att_rows]
-            except Exception:
-                sec_atts = []
+            att_rows = priv_conn.execute(
+                "SELECT * FROM attachment_results WHERE case_id=? AND status='CLEAN'",
+                (case["case_id"],),
+            ).fetchall()
+            sec_atts = [dict(r) for r in att_rows]
 
             result = run_privacy(case, raw, sec_atts, priv_conn)
             new_count += 1
@@ -384,12 +390,16 @@ def poll_and_anonymise(priv_conn: sqlite3.Connection,
         if new_count:
             print(f"\n  [Privacy] ✓ {new_count} case(s) anonymised.\n")
 
-        try:
-            rec_db.close()
-            sec_db.close()
-        except Exception:
-            pass
+        return new_count
 
+
+def poll_and_anonymise(priv_conn: sqlite3.Connection,
+                       stop_event: threading.Event) -> None:
+    """Background thread: re-run the processing pass every 5s as a fallback."""
+    print("  [Privacy] polling every 5 seconds (HTTP push is the fast path)...")
+
+    while not stop_event.is_set():
+        process_pending_privacy(priv_conn)
         stop_event.wait(5)
 
 
@@ -501,17 +511,13 @@ def render_dashboard(priv_conn: sqlite3.Connection) -> str:
     ).fetchall()
     logs = [dict(r) for r in logs]
 
-    # Pull case metadata from Ingestion
+    # Pull case metadata from the shared cases table
     case_meta: dict[str, dict] = {}
-    ing_db = open_db_ro(INGESTION_DB_PATH)
-    if ing_db:
-        try:
-            for r in ing_db.execute(
-                "SELECT case_id, source_type, subject, pipeline_step FROM cases"
-            ):
-                case_meta[r["case_id"]] = dict(r)
-        finally:
-            ing_db.close()
+    if _table_exists(priv_conn, "cases"):
+        for r in priv_conn.execute(
+            "SELECT case_id, source_type, subject, pipeline_step FROM cases"
+        ):
+            case_meta[r["case_id"]] = dict(r)
 
     # Stats
     total        = len(results)
@@ -633,28 +639,28 @@ class PrivacyDashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(page.encode())
 
+    def do_POST(self) -> None:
+        if self.path != "/notify":
+            self.send_response(404); self.end_headers(); return
+        process_pending_privacy(self.priv_conn)
+        self.send_response(204)
+        self.end_headers()
+
     def _serve_case(self, case_id: str) -> None:
         """Return JSON with original body, anonymised body, and token map for one case."""
         import json as _json
-        # Original body from reception DB
+        # Original body — same connection, just a different table now
         orig_body = ""
-        rec_db  = open_db_ro(RECEPTION_DB_PATH)
-        ing_db2 = open_db_ro(INGESTION_DB_PATH)
-        if rec_db and ing_db2:
-            try:
-                mid_row = ing_db2.execute(
-                    "SELECT message_id FROM cases WHERE case_id=?", (case_id,)
-                ).fetchone()
-                if mid_row:
-                    row = rec_db.execute(
-                        "SELECT body FROM raw_messages WHERE message_id=?",
-                        (mid_row["message_id"],),
-                    ).fetchone()
-                    if row:
-                        orig_body = row["body"] or ""
-            finally:
-                rec_db.close()
-                ing_db2.close()
+        mid_row = self.priv_conn.execute(
+            "SELECT message_id FROM cases WHERE case_id=?", (case_id,)
+        ).fetchone()
+        if mid_row:
+            row = self.priv_conn.execute(
+                "SELECT body FROM raw_messages WHERE message_id=?",
+                (mid_row["message_id"],),
+            ).fetchone()
+            if row:
+                orig_body = row["body"] or ""
 
         # Anonymised result
         result_row = self.priv_conn.execute(
@@ -703,9 +709,9 @@ def main() -> None:
     print("═"*60)
 
     priv_conn = init_privacy_db()
-    print(f"\n  ✓  Privacy DB  : {PRIVACY_DB_PATH}")
-    print(f"  ✓  Engine      : privacy/ package (Presidio)")
-    print(f"  ✓  Reading from: Security DB + Reception DB")
+    print(f"\n  ✓  Shared pipeline DB : {DB_PATH}")
+    print(f"  ✓  Engine             : privacy/ package (Presidio)")
+    print(f"  ✓  Notify endpoint    : POST /notify (pushed to by Security)")
 
     stop_event = threading.Event()
     poller = threading.Thread(

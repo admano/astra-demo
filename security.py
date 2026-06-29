@@ -38,6 +38,8 @@ import json
 import re
 import sqlite3
 import threading
+import time
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,34 +47,69 @@ from string import Template
 from typing import Any
 
 # ─────────────────────────────────────────────────────────────
-# PATHS
+# SHARED PIPELINE DATABASE — same file as every other phase.
 # ─────────────────────────────────────────────────────────────
 
-DEMO_DIR          = Path(__file__).parent
-RECEPTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_reception.db"
-INGESTION_DB_PATH = DEMO_DIR /"demo_db" / "demo_ingestion.db"
-SECURITY_DB_PATH  = DEMO_DIR /"demo_db" / "demo_security.db"
-PORT              = 8002
-TEMPLATES_DIR     = DEMO_DIR / "templates"
+DEMO_DIR      = Path(__file__).parent
+DB_PATH       = DEMO_DIR / "demo_db" / "demo_pipeline.db"
+PORT          = 8002
+TEMPLATES_DIR = DEMO_DIR / "templates"
+
+# Next phase to wake up via HTTP once a case clears security.
+# Polling below remains as a fallback in case this call fails.
+PRIVACY_NOTIFY_URL = "http://localhost:8003/notify"
 
 
 def _load_template(name: str) -> Template:
     return Template((TEMPLATES_DIR / name).read_text(encoding="utf-8"))
 
 
+def _notify_next_phase(url: str) -> None:
+    """Fire-and-forget HTTP push — see reception.py for the same helper."""
+    def _fire() -> None:
+        try:
+            urllib.request.urlopen(urllib.request.Request(url, method="POST"), timeout=2)
+        except Exception:
+            pass
+    threading.Thread(target=_fire, daemon=True).start()
+
+
 # ─────────────────────────────────────────────────────────────
 # DATABASE
 # ─────────────────────────────────────────────────────────────
 
+def _connect_shared_db(db_path: Path) -> sqlite3.Connection:
+    """
+    Connect to the pipeline DB shared by all four phases.
+
+    All four phases tend to start at once, and switching a brand-new file
+    to WAL mode briefly needs an exclusive lock — so the very first connect
+    can race with another phase doing the same thing. Retry a few times
+    instead of crashing on that one-time startup race.
+    """
+    db_path.parent.mkdir(exist_ok=True)
+    last_exc: sqlite3.OperationalError | None = None
+    for _ in range(10):
+        try:
+            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=5.0)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            return conn
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            time.sleep(0.3)
+    raise last_exc
+
+
 def init_security_db() -> sqlite3.Connection:
     """
-    Tables:
+    Security's tables in the shared pipeline DB:
       security_results   — one row per case, overall verdict
       attachment_results — one row per attachment per case
       security_log       — append-only audit events
     """
-    conn = sqlite3.connect(str(SECURITY_DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_shared_db(DB_PATH)
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS security_results (
             case_id         TEXT PRIMARY KEY,
@@ -110,13 +147,10 @@ def init_security_db() -> sqlite3.Connection:
     return conn
 
 
-def open_db(path: Path) -> sqlite3.Connection | None:
-    if not path.exists():
-        return None
-    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True,
-                           check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def _table_exists(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+    ).fetchone() is not None
 
 
 def already_checked(sec_conn: sqlite3.Connection, case_id: str) -> bool:
@@ -444,21 +478,15 @@ def run_security(case: dict[str, Any],
     """, result)
     sec_conn.commit()
 
-    # ── Advance pipeline step in Ingestion DB ─────────────────
+    # ── Advance pipeline step ─────────────────────────────────
     # In production: Hatchet advances the step automatically.
-    # In demo: we update the cases table directly.
-    try:
-        ing_conn = sqlite3.connect(str(INGESTION_DB_PATH),
-                                   check_same_thread=False)
-        next_step = "SECURITY_ESCALATE" if verdict == "ESCALATE" else "SECURITY_DONE"
-        ing_conn.execute(
-            "UPDATE cases SET pipeline_step = ? WHERE case_id = ?",
-            (next_step, case_id),
-        )
-        ing_conn.commit()
-        ing_conn.close()
-    except Exception:
-        pass  # demo — non-critical
+    # In demo: we update the (shared) cases table directly.
+    next_step = "SECURITY_ESCALATE" if verdict == "ESCALATE" else "SECURITY_DONE"
+    sec_conn.execute(
+        "UPDATE cases SET pipeline_step = ? WHERE case_id = ?",
+        (next_step, case_id),
+    )
+    sec_conn.commit()
 
     log_event(sec_conn, case_id, "SECURITY_DONE",
               f"verdict={verdict} attachments={len(att_names)} "
@@ -468,46 +496,40 @@ def run_security(case: dict[str, Any],
 
 
 # ─────────────────────────────────────────────────────────────
-# POLLING LOOP
+# PROCESSING PASS
+# Reads pending cases from the shared DB and runs security checks.
+# Triggered immediately via HTTP /notify, and on a 5s timer as a
+# fallback in case a notify call ever gets missed.
 # ─────────────────────────────────────────────────────────────
 
-def poll_and_check(sec_conn: sqlite3.Connection,
-                   stop_event: threading.Event) -> None:
-    print("  [Security] polling Ingestion DB every 5 seconds...")
+_PROCESS_LOCK = threading.Lock()
 
-    while not stop_event.is_set():
-        ing_db  = open_db(INGESTION_DB_PATH)
-        rec_db  = open_db(RECEPTION_DB_PATH)
 
-        if ing_db is None or rec_db is None:
-            print("  [Security] waiting for upstream DBs...")
-            stop_event.wait(5)
-            continue
+def process_pending_security(sec_conn: sqlite3.Connection) -> int:
+    """Run security checks on every pending case. Returns how many were checked."""
+    with _PROCESS_LOCK:
+        if not _table_exists(sec_conn, "cases"):
+            return 0
 
-        try:
-            # Pick up cases that finished Ingestion and haven't been security-checked
-            pending = ing_db.execute("""
-                SELECT * FROM cases
-                WHERE pipeline_step = 'INGESTION'
-            """).fetchall()
-        finally:
-            ing_db.close()
+        # Pick up cases that finished Ingestion and haven't been security-checked
+        pending = sec_conn.execute("""
+            SELECT * FROM cases
+            WHERE pipeline_step = 'INGESTION'
+        """).fetchall()
 
         new_count = 0
+        any_cleared = False
         for row in pending:
             case = dict(row)
             if already_checked(sec_conn, case["case_id"]):
                 continue
 
-            # Join to Reception DB for subject + body + attachment_names
-            try:
-                raw_row = rec_db.execute(
-                    "SELECT * FROM raw_messages WHERE message_id = ?",
-                    (case["message_id"],),
-                ).fetchone()
-                raw = dict(raw_row) if raw_row else {}
-            except Exception:
-                raw = {}
+            # Join to Reception's raw_messages for subject + body + attachment_names
+            raw_row = sec_conn.execute(
+                "SELECT * FROM raw_messages WHERE message_id = ?",
+                (case["message_id"],),
+            ).fetchone()
+            raw = dict(raw_row) if raw_row else {}
 
             # Merge attachment_names from both sources
             # (Ingestion carries the filenames; Reception has the body)
@@ -518,14 +540,24 @@ def poll_and_check(sec_conn: sqlite3.Connection,
             new_count += 1
             _print_result(case, result)
 
+            if result["verdict"] != "ESCALATE":
+                any_cleared = True
+
         if new_count:
             print(f"\n  [Security] ✓ {new_count} case(s) checked.\n")
+        if any_cleared:
+            _notify_next_phase(PRIVACY_NOTIFY_URL)
 
-        try:
-            rec_db.close()
-        except Exception:
-            pass
+        return new_count
 
+
+def poll_and_check(sec_conn: sqlite3.Connection,
+                   stop_event: threading.Event) -> None:
+    """Background thread: re-run the processing pass every 5s as a fallback."""
+    print("  [Security] polling every 5 seconds (HTTP push is the fast path)...")
+
+    while not stop_event.is_set():
+        process_pending_security(sec_conn)
         stop_event.wait(5)
 
 
@@ -608,15 +640,11 @@ def render_dashboard(sec_conn: sqlite3.Connection) -> str:
         <div class="stat-label">Blocked</div></div>
     </div>"""
 
-    # Pull case info from ingestion DB for source_type display
+    # Pull case info from the shared cases table for source_type display
     case_meta: dict[str, dict] = {}
-    ing_db = open_db(INGESTION_DB_PATH)
-    if ing_db:
-        try:
-            for row in ing_db.execute("SELECT case_id, source_type, subject, pipeline_step FROM cases"):
-                case_meta[row["case_id"]] = dict(row)
-        finally:
-            ing_db.close()
+    if _table_exists(sec_conn, "cases"):
+        for row in sec_conn.execute("SELECT case_id, source_type, subject, pipeline_step FROM cases"):
+            case_meta[row["case_id"]] = dict(row)
 
     # Results table
     table_rows = ""
@@ -775,6 +803,13 @@ class SecurityDashboardHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(page.encode())
 
+    def do_POST(self) -> None:
+        if self.path != "/notify":
+            self.send_response(404); self.end_headers(); return
+        process_pending_security(self.sec_conn)
+        self.send_response(204)
+        self.end_headers()
+
 
 def make_handler(conn: sqlite3.Connection):
     class H(SecurityDashboardHandler):
@@ -792,8 +827,8 @@ def main() -> None:
     print("═"*60)
 
     sec_conn = init_security_db()
-    print(f"\n  ✓  Security DB : {SECURITY_DB_PATH}")
-    print(f"  ✓  Reading from: {INGESTION_DB_PATH}")
+    print(f"\n  ✓  Shared pipeline DB : {DB_PATH}")
+    print(f"  ✓  Notify endpoint    : POST /notify (pushed to by Ingestion)")
 
     stop_event = threading.Event()
     poller = threading.Thread(
