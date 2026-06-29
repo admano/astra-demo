@@ -630,6 +630,9 @@ class PrivacyDashboardHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path == "/favicon.ico":
             self.send_response(204); self.end_headers(); return
+        if self.path == "/data":
+            self._serve_data()
+            return
         if self.path.startswith("/case/"):
             self._serve_case(self.path[6:])
             return
@@ -645,6 +648,14 @@ class PrivacyDashboardHandler(http.server.BaseHTTPRequestHandler):
         process_pending_privacy(self.priv_conn)
         self.send_response(204)
         self.end_headers()
+
+    def _serve_data(self) -> None:
+        payload = render_data_json(self.priv_conn).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def _serve_case(self, case_id: str) -> None:
         """Return JSON with original body, anonymised body, and token map for one case."""
@@ -690,6 +701,82 @@ class PrivacyDashboardHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+
+def render_data_json(priv_conn: sqlite3.Connection) -> str:
+    """Return dashboard data as JSON for background polling (no full page reload)."""
+    results = priv_conn.execute(
+        "SELECT * FROM privacy_results ORDER BY processed_at DESC"
+    ).fetchall()
+    results = [dict(r) for r in results]
+
+    all_tokens = priv_conn.execute(
+        "SELECT case_id, pii_type FROM pii_tokens"
+    ).fetchall()
+    all_tokens = [dict(r) for r in all_tokens]
+
+    logs = priv_conn.execute(
+        "SELECT event, ts, detail FROM privacy_log ORDER BY ts DESC LIMIT 80"
+    ).fetchall()
+    logs = [dict(r) for r in logs]
+
+    case_meta: dict[str, dict] = {}
+    if _table_exists(priv_conn, "cases"):
+        for r in priv_conn.execute(
+            "SELECT case_id, source_type, subject FROM cases"
+        ):
+            case_meta[r["case_id"]] = dict(r)
+
+    total        = len(results)
+    total_tokens = len(all_tokens)
+    types_found  = len({t["pii_type"] for t in all_tokens})
+    k_ok         = sum(1 for r in results if r["k_anon_ok"])
+    avg_risk     = (
+        round(sum(r.get("risk_score", 0.0) for r in results) / total, 3)
+        if total else 0.0
+    )
+
+    cases_out: list[dict] = []
+    for r in results:
+        meta = case_meta.get(r["case_id"], {})
+        type_counts: dict[str, int] = {}
+        n_tok = 0
+        for t in all_tokens:
+            if t["case_id"] == r["case_id"]:
+                n_tok += 1
+                type_counts[t["pii_type"]] = type_counts.get(t["pii_type"], 0) + 1
+        cases_out.append({
+            "case_id":          r["case_id"],
+            "source_type":      meta.get("source_type", ""),
+            "subject":          meta.get("subject", ""),
+            "n_tokens":         n_tok,
+            "type_counts":      type_counts,
+            "k_anon_ok":        r["k_anon_ok"],
+            "risk_score":       r.get("risk_score", 0.0),
+            "pipeline_status":  r.get("pipeline_status", "safe"),
+            "vault_session_id": r.get("vault_session_id", ""),
+        })
+
+    log_out = [
+        {
+            "event":  lg["event"],
+            "ts":     lg["ts"][11:19],
+            "detail": (lg.get("detail") or "")[:80],
+        }
+        for lg in logs
+    ]
+
+    return json.dumps({
+        "stats": {
+            "total":        total,
+            "total_tokens": total_tokens,
+            "types_found":  types_found,
+            "k_ok":         k_ok,
+            "avg_risk":     avg_risk,
+        },
+        "cases": cases_out,
+        "logs":  log_out,
+    })
 
 
 def make_handler(conn: sqlite3.Connection):

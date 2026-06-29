@@ -4,7 +4,6 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="5">
 <title>Phase 04 — Privacy</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -124,7 +123,7 @@ tr.case-row.selected td{background:#ede9fe}
           <th>PII Found</th><th>k-Anon</th><th>Risk / Status</th><th>Vault Session</th>
         </tr>
       </thead>
-      <tbody>$tbl_rows</tbody>
+      <tbody id="cases-tbody">$tbl_rows</tbody>
     </table>
   </div>
 
@@ -164,7 +163,7 @@ tr.case-row.selected td{background:#ede9fe}
 
   <div class="sec-title">Audit Log</div>
   <div class="log-panel">$log_lines</div>
-  <p class="refresh-note">Auto-refreshes every 5 seconds · click a row to inspect</p>
+  <p class="refresh-note">Updates silently every 5 seconds · click a row to inspect</p>
 </div>
 
 <script>
@@ -176,8 +175,18 @@ const TYPE_CSS = {
   URL:'tp-date', PERSON:'tp-person', ADDRESS:'tp-address',
   ZIP:'tp-zip', AHV:'tp-ahv', DATE:'tp-date',
 };
+const SRC_LABELS = {
+  DIRECT_EMAIL:'Email', STAFF_FORWARD:'Staff',
+  POSTAL_SCAN:'Scan', WEB_FORM:'Web Form',
+};
+const EV_CSS = {
+  SUBJECT_ANONYMISED:'ev-subj', BODY_ANONYMISED:'ev-body',
+  ATTACHMENT_ANONYMISED:'ev-att', TOKENS_STORED:'ev-tok',
+  K_ANONYMITY_OK:'ev-kanon', K_ANONYMITY_FAIL:'ev-done',
+  PRIVACY_DONE:'ev-done',
+};
 
-function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+function esc(s){ const d=document.createElement('div'); d.textContent=String(s||''); return d.innerHTML; }
 
 function highlightTags(text){
   return esc(text).replace(
@@ -185,6 +194,9 @@ function highlightTags(text){
     '<span class="highlight">$$1</span>'
   );
 }
+
+// Tracks which case the user has opened in the detail panel
+let selectedCaseId = sessionStorage.getItem('selected_case');
 
 function selectRow(tr, caseId){
   document.querySelectorAll('tr.case-row').forEach(r => r.classList.remove('selected'));
@@ -202,7 +214,6 @@ function selectRow(tr, caseId){
       document.getElementById('map-title').childNodes[0].textContent =
         'Pseudonym Map — case ' + caseId.substring(0,8) + '…  ';
 
-      // Risk note
       const rn = document.getElementById('risk-note');
       if(d.status === 'escalated'){
         rn.innerHTML = '<div style="background:#fef3c7;border:1px solid #fcd34d;border-radius:5px;padding:8px 14px;margin-bottom:10px;font-size:12px;color:#92400e">⚠️ Escalated — risk score '+d.risk_score.toFixed(3)+' exceeds safe threshold. Flagged for manual review.</div>';
@@ -215,7 +226,6 @@ function selectRow(tr, caseId){
       document.getElementById('orig-body').textContent = (d.orig_body || '').substring(0, 600);
       document.getElementById('anon-body').innerHTML   = highlightTags((d.body_anon || '').substring(0, 600));
 
-      // Token map
       const tbody = document.getElementById('token-rows');
       if(!d.tokens || d.tokens.length === 0){
         tbody.innerHTML = '<tr><td colspan="3" class="empty">No tokens found</td></tr>';
@@ -234,19 +244,106 @@ function selectRow(tr, caseId){
     .catch(err => console.error('Case fetch failed:', err));
 }
 
-// Wire up all rows
-document.querySelectorAll('tr.case-row').forEach(tr => {
-  const data = JSON.parse(tr.dataset.case);
-  tr.addEventListener('click', () => {
-    sessionStorage.setItem('selected_case', data.case_id);
-    selectRow(tr, data.case_id);
+function wireRows(){
+  document.querySelectorAll('tr.case-row').forEach(tr => {
+    const data = JSON.parse(tr.dataset.case);
+    tr.addEventListener('click', () => {
+      selectedCaseId = data.case_id;
+      sessionStorage.setItem('selected_case', data.case_id);
+      selectRow(tr, data.case_id);
+    });
   });
-});
+}
+
+// ── Background update functions ───────────────────────────────────────────────
+// These patch only the relevant DOM nodes so scroll position, focus, and the
+// detail panel the user is reading are never disturbed.
+
+function renderStats(stats){
+  const rc = stats.avg_risk > 0.1 ? '#dc2626' : '#065f46';
+  document.querySelector('.stats').innerHTML =
+    '<div class="stat"><div class="stat-num">'+stats.total+'</div>'+
+    '<div class="stat-label">Cases Anonymised</div></div>'+
+    '<div class="stat"><div class="stat-num" style="color:#7c3aed">'+stats.total_tokens+'</div>'+
+    '<div class="stat-label">PII Tokens</div></div>'+
+    '<div class="stat"><div class="stat-num">'+stats.types_found+'</div>'+
+    '<div class="stat-label">PII Types Found</div></div>'+
+    '<div class="stat"><div class="stat-num" style="color:#065f46">'+stats.k_ok+'/'+stats.total+'</div>'+
+    '<div class="stat-label">k-Anon Passed</div></div>'+
+    '<div class="stat"><div class="stat-num" style="color:'+rc+'">'+stats.avg_risk.toFixed(3)+'</div>'+
+    '<div class="stat-label">Avg Risk Score</div></div>';
+}
+
+function renderRows(cases){
+  const tbody = document.getElementById('cases-tbody');
+  if(!cases || cases.length === 0){
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">Waiting for Security to complete...</td></tr>';
+    return;
+  }
+  tbody.innerHTML = cases.map(c => {
+    const src  = SRC_LABELS[c.source_type] || '';
+    const subj = esc((c.subject||'').substring(0,40));
+    const pills = Object.entries(c.type_counts||{}).sort().map(([tp,cnt]) =>
+      '<span class="type-pill '+(TYPE_CSS[tp]||'')+'">'+esc(tp)+':'+cnt+'</span>'
+    ).join(' ');
+    const kIcon = c.k_anon_ok ? '✅' : '⚠️';
+    const risk  = Number(c.risk_score).toFixed(3);
+    const rc    = {safe:'#065f46',escalated:'#92400e',blocked:'#dc2626'}[c.pipeline_status]||'#374151';
+    const sel   = c.case_id === selectedCaseId ? ' selected' : '';
+    // Single-quote attribute value: JSON only contains double-quotes, but string
+    // values can have apostrophes — escape them to &#39;
+    const cd = JSON.stringify({
+      case_id:c.case_id, subject:c.subject||'', src,
+      risk:c.risk_score, status:c.pipeline_status, session:c.vault_session_id||'',
+    }).replace(/'/g,'&#39;');
+    return '<tr class="case-row'+sel+'" data-case=\''+cd+'\' style="cursor:pointer">'+
+      '<td><span class="mono">'+esc(c.case_id.substring(0,8))+'…</span></td>'+
+      '<td>'+esc(src)+'</td>'+
+      '<td title="'+esc(c.subject||'')+'">'+subj+'</td>'+
+      '<td><strong>'+c.n_tokens+'</strong> '+pills+'</td>'+
+      '<td>'+kIcon+'</td>'+
+      '<td style="color:'+rc+';font-weight:600">'+risk+' '+esc(c.pipeline_status)+'</td>'+
+      '<td><span class="mono" style="font-size:10px">'+esc((c.vault_session_id||'').substring(0,12))+'</span></td>'+
+      '</tr>';
+  }).join('');
+  wireRows();
+}
+
+function renderLog(logs){
+  const panel = document.querySelector('.log-panel');
+  if(!logs || logs.length === 0){
+    panel.innerHTML = '<div class="log-line" style="color:#484f58">— no events yet —</div>';
+    return;
+  }
+  panel.innerHTML = logs.map(lg =>
+    '<div class="log-line"><span class="ts">'+esc(lg.ts)+'</span>  '+
+    '<span class="'+(EV_CSS[lg.event]||'')+'">'+esc(lg.event)+'</span>  '+
+    esc(lg.detail)+'</div>'
+  ).join('\n');
+}
+
+// Wire up the server-rendered rows on first load
+wireRows();
 
 // Auto-select: restore last selection, or fall back to first row
-const saved = sessionStorage.getItem('selected_case');
-const target = saved
-  ? document.querySelector('tr.case-row[data-case*="' + saved + '"]')
-  : null;
-(target || document.querySelector('tr.case-row'))?.click();
+{
+  const saved = sessionStorage.getItem('selected_case');
+  const target = saved
+    ? document.querySelector('tr.case-row[data-case*="'+saved+'"]')
+    : null;
+  (target || document.querySelector('tr.case-row'))?.click();
+}
+
+// Poll /data every 5 s — updates stats, table rows, and audit log silently.
+// The detail panel and page scroll are never touched by this loop.
+setInterval(function(){
+  fetch('/data')
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      renderStats(d.stats);
+      renderRows(d.cases);
+      renderLog(d.logs);
+    })
+    .catch(function(){/* swallow network errors between polls */});
+}, 5000);
 </script>
